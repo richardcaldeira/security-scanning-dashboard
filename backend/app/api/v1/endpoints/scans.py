@@ -1,243 +1,169 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List, Dict, Any
 import uuid
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
+from typing import List
 
-from app.core.database import get_db
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from sqlalchemy import select, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db, AsyncSessionLocal
+from app.core.config import settings
 from app.core.security import get_current_user
 from app.services.scan_service import ScanService
+from app.services.mcp_client import MCPClient
 from app.models.scan import Scan
 from app.api.v1.schemas.scan import ScanCreate, ScanResponse, ScanStatus
 
-# Create router
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/scans", tags=["scans"])
-security = HTTPBearer()
 
-# Initialize scan service
-scan_service = ScanService()
+# Scan service wired to the real MCP security-tools backend
+scan_service = ScanService(MCPClient(settings.MCP_SERVER_URL))
 
-@router.post("/", response_model=ScanResponse)
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _risk_level(output: str) -> str:
+    if not output:
+        return "Low"
+    low = output.lower()
+    if any(k in low for k in ["vulnerable", "exploit", "critical", "remote code execution", "sql injection"]):
+        return "High"
+    if any(k in low for k in ["warning", "medium", "cve", "outdated", "misconfiguration"]):
+        return "Medium"
+    return "Low"
+
+
+async def execute_scan_background(scan_id: str):
+    """Run the scan via the MCP backend and persist the result."""
+    async with AsyncSessionLocal() as db:
+        scan = await db.get(Scan, scan_id)
+        if scan is None:
+            logger.error("Scan %s not found for execution", scan_id)
+            return
+        scan.status = "running"
+        scan.started_at = _now()
+        await db.commit()
+
+    result = await scan_service.execute_scan(scan.tool, scan.config or {})
+    output = result.get("output", "") or ""
+    error = result.get("error", "") or ""
+    success = result.get("success", False) and not error
+
+    async with AsyncSessionLocal() as db:
+        scan = await db.get(Scan, scan_id)
+        if scan is None:
+            return
+        scan.status = "completed" if success else "failed"
+        scan.completed_at = _now()
+        scan.output = output
+        scan.error = error
+        scan.findings = len([ln for ln in output.splitlines() if ln.strip()]) if output else 0
+        scan.risk_level = _risk_level(output)
+        await db.commit()
+    logger.info("Scan %s finished: %s", scan_id, scan.status)
+
+
+@router.post("", response_model=ScanResponse)
 async def create_scan(
     scan_data: ScanCreate,
     background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Create a new scan and execute it in background"""
-    
-    # Create scan record
+    """Create a scan and execute it in the background."""
     scan = Scan(
         id=str(uuid.uuid4()),
         tool=scan_data.tool,
-        target=scan_data.config.get("target"),
+        target=scan_data.config.get("target") or scan_data.config.get("term") or "unknown",
         config=scan_data.config,
         status="pending",
         created_by=current_user["username"],
-        created_at=datetime.utcnow()
+        created_at=_now(),
     )
-    
-    # Save to database
     db.add(scan)
     await db.commit()
     await db.refresh(scan)
-    
-    # Add background task to execute scan
-    background_tasks.add_task(
-        execute_scan_background,
-        scan.id
-    )
-    
-    return ScanResponse.from_orm(scan)
 
-@router.get("/", response_model=List[ScanResponse])
+    background_tasks.add_task(execute_scan_background, scan.id)
+    return ScanResponse.model_validate(scan)
+
+
+@router.get("", response_model=List[ScanResponse])
 async def get_scans(
     skip: int = 0,
     limit: int = 50,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Get list of scans"""
-    
-    # Query scans from database
+    """List scans for the current user, newest first."""
     result = await db.execute(
-        "SELECT * FROM scans WHERE created_by = :user ORDER BY created_at DESC LIMIT :limit OFFSET :skip",
-        {"user": current_user["username"], "limit": limit, "skip": skip}
+        select(Scan)
+        .where(Scan.created_by == current_user["username"])
+        .order_by(Scan.created_at.desc())
+        .offset(skip)
+        .limit(limit)
     )
-    scans = result.fetchall()
-    
-    return [ScanResponse(**scan) for scan in scans]
+    scans = result.scalars().all()
+    return [ScanResponse.model_validate(s) for s in scans]
+
 
 @router.get("/{scan_id}", response_model=ScanResponse)
 async def get_scan(
     scan_id: str,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Get specific scan by ID"""
-    
-    # Query scan from database
-    result = await db.execute(
-        "SELECT * FROM scans WHERE id = :scan_id AND created_by = :user",
-        {"scan_id": scan_id, "user": current_user["username"]}
-    )
-    scan = result.fetchone()
-    
-    if not scan:
+    scan = await db.get(Scan, scan_id)
+    if scan is None or scan.created_by != current_user["username"]:
         raise HTTPException(status_code=404, detail="Scan not found")
-    
-    return ScanResponse(**scan)
+    return ScanResponse.model_validate(scan)
+
 
 @router.get("/{scan_id}/status", response_model=ScanStatus)
 async def get_scan_status(
     scan_id: str,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Get scan status"""
-    
-    # Query scan from database
-    result = await db.execute(
-        "SELECT status, progress, started_at, completed_at FROM scans WHERE id = :scan_id AND created_by = :user",
-        {"scan_id": scan_id, "user": current_user["username"]}
-    )
-    scan = result.fetchone()
-    
-    if not scan:
+    scan = await db.get(Scan, scan_id)
+    if scan is None or scan.created_by != current_user["username"]:
         raise HTTPException(status_code=404, detail="Scan not found")
-    
-    return ScanStatus(**scan)
+    return ScanStatus(
+        status=scan.status,
+        started_at=scan.started_at,
+        completed_at=scan.completed_at,
+    )
+
 
 @router.delete("/{scan_id}")
 async def delete_scan(
     scan_id: str,
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Delete a scan"""
-    
-    # Check if scan exists and belongs to user
-    result = await db.execute(
-        "SELECT id FROM scans WHERE id = :scan_id AND created_by = :user",
-        {"scan_id": scan_id, "user": current_user["username"]}
-    )
-    scan = result.fetchone()
-    
-    if not scan:
+    scan = await db.get(Scan, scan_id)
+    if scan is None or scan.created_by != current_user["username"]:
         raise HTTPException(status_code=404, detail="Scan not found")
-    
-    # Delete scan
-    await db.execute(
-        "DELETE FROM scans WHERE id = :scan_id",
-        {"scan_id": scan_id}
-    )
+    await db.execute(delete(Scan).where(Scan.id == scan_id))
     await db.commit()
-    
     return {"message": "Scan deleted successfully"}
+
 
 @router.post("/{scan_id}/export")
 async def export_scan(
     scan_id: str,
     format: str = "json",
     current_user: dict = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
-    """Export scan results in specified format"""
-    
-    # Query scan from database
-    result = await db.execute(
-        "SELECT * FROM scans WHERE id = :scan_id AND created_by = :user",
-        {"scan_id": scan_id, "user": current_user["username"]}
-    )
-    scan = result.fetchone()
-    
-    if not scan:
+    scan = await db.get(Scan, scan_id)
+    if scan is None or scan.created_by != current_user["username"]:
         raise HTTPException(status_code=404, detail="Scan not found")
-    
-    # Export based on format
     if format == "json":
-        return ScanResponse(**scan).dict()
-    elif format == "csv":
-        # Convert to CSV format
-        return {"csv_data": "CSV export functionality"}
-    elif format == "pdf":
-        # Generate PDF report
-        return {"pdf_url": f"/exports/{scan_id}.pdf"}
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported export format")
-
-# Background task function
-async def execute_scan_background(scan_id: str):
-    """Execute scan in background"""
-    try:
-        # Get scan from database
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                "SELECT * FROM scans WHERE id = :scan_id",
-                {"scan_id": scan_id}
-            )
-            scan = result.fetchone()
-            
-            if not scan:
-                return
-            
-            # Update status to running
-            await db.execute(
-                "UPDATE scans SET status = 'running', started_at = :now WHERE id = :scan_id",
-                {"scan_id": scan_id, "now": datetime.utcnow()}
-            )
-            await db.commit()
-            
-            # Execute scan via MCP
-            result = await scan_service.execute_scan(scan.tool, scan.config)
-            
-            # Update scan with results
-            await db.execute(
-                """UPDATE scans SET 
-                   status = :status, 
-                   completed_at = :now,
-                   output = :output,
-                   error = :error,
-                   findings = :findings,
-                   risk_level = :risk_level
-                   WHERE id = :scan_id""",
-                {
-                    "scan_id": scan_id,
-                    "status": "completed" if result.get("success") else "failed",
-                    "now": datetime.utcnow(),
-                    "output": result.get("output", ""),
-                    "error": result.get("error", ""),
-                    "findings": len(result.get("output", "").split('\n')) if result.get("output") else 0,
-                    "risk_level": determine_risk_level(result.get("output", ""))
-                }
-            )
-            await db.commit()
-            
-    except Exception as e:
-        # Update scan status to failed
-        async with AsyncSessionLocal() as db:
-            await db.execute(
-                "UPDATE scans SET status = 'failed', error = :error, completed_at = :now WHERE id = :scan_id",
-                {"scan_id": scan_id, "error": str(e), "now": datetime.utcnow()}
-            )
-            await db.commit()
-
-def determine_risk_level(output: str) -> str:
-    """Determine risk level based on scan output"""
-    if not output:
-        return "Low"
-    
-    output_lower = output.lower()
-    
-    # High risk indicators
-    high_risk_keywords = ["vulnerable", "exploit", "critical", "remote code execution", "sql injection"]
-    if any(keyword in output_lower for keyword in high_risk_keywords):
-        return "High"
-    
-    # Medium risk indicators
-    medium_risk_keywords = ["warning", "medium", "cve", "outdated", "misconfiguration"]
-    if any(keyword in output_lower for keyword in medium_risk_keywords):
-        return "Medium"
-    
-    return "Low"
+        return ScanResponse.model_validate(scan).model_dump()
+    raise HTTPException(status_code=400, detail="Unsupported export format")

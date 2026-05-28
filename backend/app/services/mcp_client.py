@@ -12,7 +12,9 @@ class MCPClient:
     
     async def connect(self):
         """Initialize HTTP client"""
-        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=30.0)
+        # Tool scans can run up to MAX_SCAN_TIMEOUT (300s) on the MCP side;
+        # allow a little more so the HTTP call doesn't time out first.
+        self.client = httpx.AsyncClient(base_url=self.base_url, timeout=320.0)
         
         # Test connection
         try:

@@ -41,7 +41,9 @@ export const useScan = (scanId) => {
     },
     {
       enabled: !!scanId,
-      staleTime: 1 * 60 * 1000, // 1 minute
+      // Poll while the scan is still running, then stop.
+      refetchInterval: (data) =>
+        data && (data.status === 'pending' || data.status === 'running') ? 2000 : false,
     }
   )
 }
@@ -160,26 +162,13 @@ export const useToolConfig = (toolId) => {
   )
 }
 
-// Hook for getting system stats
+// Hook for getting system stats (real metrics from the backend)
 export const useSystemStats = () => {
   return useQuery(
     ['stats', 'system'],
     async () => {
-      // Mock system stats - in real app, this would come from API
-      return {
-        totalScans: 156,
-        activeScans: 2,
-        completedToday: 12,
-        threatsFound: 8,
-        scansTrend: 15,
-        completionTrend: 8,
-        threatsTrend: -5,
-        systemStatus: {
-          cpu: 45,
-          memory: 62,
-          disk: 38,
-        },
-      }
+      const { data } = await api.get('/stats')
+      return data
     },
     {
       staleTime: 30 * 1000, // 30 seconds

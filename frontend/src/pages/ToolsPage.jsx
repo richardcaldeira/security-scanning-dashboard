@@ -28,7 +28,7 @@ import {
   Search,
 } from '@mui/icons-material'
 
-import { useToolConfig, useExecuteScan } from '../hooks/useApi'
+import { useToolConfig, useExecuteScan, useScan } from '../hooks/useApi'
 import ScanResults from '../components/Scans/ScanResults'
 import ToolConfig from '../components/Tools/ToolConfig'
 
@@ -38,6 +38,8 @@ const ToolsPage = () => {
   const [selectedTool, setSelectedTool] = useState(toolId || 'nmap')
   const [scanConfig, setScanConfig] = useState({})
   const [currentScan, setCurrentScan] = useState(null)
+  // Live-poll the created scan so the results panel updates pending -> completed
+  const { data: liveScan } = useScan(currentScan?.id)
 
   const { data: toolConfig, isLoading: configLoading } = useToolConfig(selectedTool)
   const { mutate: executeScan, isLoading: scanLoading } = useExecuteScan()
@@ -273,7 +275,7 @@ const ToolsPage = () => {
                   </Typography>
 
                   {currentScan ? (
-                    <ScanResults scan={currentScan} />
+                    <ScanResults scan={liveScan || currentScan} />
                   ) : (
                     <Box
                       display="flex"

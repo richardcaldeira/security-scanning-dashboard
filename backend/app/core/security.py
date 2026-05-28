@@ -41,22 +41,27 @@ def verify_token(token: str) -> dict:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-async def get_current_user(token: str = Depends(HTTPBearer())):
-    """Get current user from JWT token."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
-    try:
-        payload = verify_token(token.credentials)
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    # In a real app, you would fetch user from database
-    # For now, we'll return a simple user object
-    return {"username": username, "active": True}
+DEFAULT_USER = "admin"
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+):
+    """Resolve the current user.
+
+    Network-level access is enforced by the upstream reverse proxy (Caddy
+    basic-auth), so a bearer token is optional here. If a valid JWT is present
+    we honour its subject; otherwise we fall back to the default single user.
+    """
+    if credentials is not None:
+        try:
+            payload = jwt.decode(
+                credentials.credentials,
+                settings.JWT_SECRET_KEY,
+                algorithms=[settings.JWT_ALGORITHM],
+            )
+            username = payload.get("sub") or DEFAULT_USER
+            return {"username": username, "active": True}
+        except JWTError:
+            pass
+    return {"username": DEFAULT_USER, "active": True}
