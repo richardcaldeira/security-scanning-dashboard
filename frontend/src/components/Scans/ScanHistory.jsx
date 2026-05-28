@@ -109,7 +109,7 @@ const ScanHistory = ({ scans = [], loading = false }) => {
     )
   }
 
-  if (!scans || scans.length === 0) {
+  if (!Array.isArray(scans) || scans.length === 0) {
     return (
       <Box
         display="flex"

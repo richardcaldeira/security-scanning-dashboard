@@ -102,7 +102,7 @@ const ScanResults = ({ scanId }) => {
     ? scans?.filter(scan => scan.id === scanId) 
     : scans
 
-  if (!displayScans || displayScans.length === 0) {
+  if (!Array.isArray(displayScans) || displayScans.length === 0) {
     return (
       <Box
         display="flex"
