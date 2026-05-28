@@ -23,7 +23,7 @@ import {
   Settings,
   Security,
   Language,
-  Database,
+  Storage as Database,
   Folder,
   Search,
 } from '@mui/icons-material'
